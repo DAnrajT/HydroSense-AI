@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Mimic</title>
+<style>
+  :root{--bg:#f4f6f9;--card:#fff;--text:#1d2733;--muted:#6b7785;--line:#dde3ea;--blue:#1f7ae0}
+  @media (prefers-color-scheme:dark){:root{--bg:#10151b;--card:#1a212a;--text:#e8edf2;--muted:#93a0ae;--line:#2b3541}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;justify-content:center;padding:20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;width:100%;max-width:460px}
+  h1{margin:0 0 4px;font-size:20px} p{margin:0 0 16px;color:var(--muted);font-size:13px}
+  .f{margin-bottom:14px}
+  .f label{display:flex;justify-content:space-between;font-weight:600;margin-bottom:4px}
+  .f input[type=number]{width:80px;font:inherit;padding:3px 6px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--text);text-align:right}
+  input[type=range]{width:100%}
+  select,input[type=text]{font:inherit;width:100%;padding:7px 9px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
+  button{font:inherit;padding:9px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer}
+  button.primary{background:var(--blue);border-color:var(--blue);color:#fff}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;margin:12px 0 6px;font-size:13px;white-space:pre-wrap}
+  .s{font-size:12px;color:var(--muted)}
+  hr{border:0;border-top:1px solid var(--line);margin:14px 0}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>ESP32 Mimic</h1>
+  <p>Set the sensor values by hand. This page sends them exactly as the real ESP32 will.</p>
+
+  <div class="f">
+    <label>Inlet flow (L/min) <input type="number" id="qiN" min="0" max="20" step="0.1" value="8"></label>
+    <input type="range" id="qi" min="0" max="20" step="0.1" value="8">
+  </div>
+  <div class="f">
+    <label>Outlet flow (L/min) <input type="number" id="qoN" min="0" max="20" step="0.1" value="8"></label>
+    <input type="range" id="qo" min="0" max="20" step="0.1" value="8">
+  </div>
+  <div class="f">
+    <label>Pressure (bar) <input type="number" id="pN" min="0" max="5" step="0.1" value="3"></label>
+    <input type="range" id="p" min="0" max="5" step="0.1" value="3">
+  </div>
+  <div class="f">
+    <label>Valve</label>
+    <select id="valve"><option value="open">open</option><option value="closed">closed</option></select>
+  </div>
+  <div class="f">
+    <label>Label (for dataset)</label>
+    <select id="label"><option value="0">0 - normal</option><option value="1">1 - leak</option></select>
+  </div>
+
+  <div class="row">
+    <button class="primary" id="sendBtn">Send once</button>
+    <button id="autoBtn">Auto send: OFF</button>
+    <label class="s row"><input type="checkbox" id="jit" checked> Add small noise</label>
+  </div>
+
+  <pre id="json">-</pre>
+  <div class="s" id="net">Nothing sent yet</div>
+
+  <hr>
+  <div class="f" style="margin-bottom:6px">
+    <label>Backend URL</label>
+    <input type="text" id="url" value="https://water-leak-detection-5228d-default-rtdb.asia-southeast1.firebasedatabase.app/">
+  </div>
+  <div class="s">For Firebase, paste your Realtime Database URL here (like https://your-project-default-rtdb.firebaseio.com). Readings go to /readings, the newest to /latest, and the page reads /command for valve close or open. Any other URL gets a plain POST. Your real ESP32 will send the same JSON (without the label).</div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+// keep slider and number box in sync
+[['qi','qiN'],['qo','qoN'],['p','pN']].forEach(([a,b]) => {
+  $(a).oninput = () => $(b).value = $(a).value;
+  $(b).oninput = () => $(a).value = $(b).value;
+});
+const n = v => v * (1 + (Math.random() + Math.random() - 1) * 0.03);
+let timer = null;
+
+function build(){
+  const j = $('jit').checked;
+  const f = id => Math.max(0, +(j ? n(+$(id).value) : +$(id).value).toFixed(2));
+  return {
+    ts: Math.floor(Date.now() / 1000),
+    inlet_flow: f('qi'), outlet_flow: f('qo'), pressure: f('p'),
+    valve: $('valve').value, label: +$('label').value
+  };
+}
+async function send(){
+  const r = build();
+  $('json').textContent = JSON.stringify(r, null, 2);
+  try{
+    const base = $('url').value.replace(/\/+$/, '');
+    const fb = /firebaseio\.com|firebasedatabase\.app/.test(base);
+    const opts = {headers:{'Content-Type':'application/json'}, body:JSON.stringify(r)};
+    let res, cmd = {};
+    if(fb){
+      // Firebase Realtime Database REST: history + latest, then read the command node
+      res = await fetch(base + '/readings.json', {method:'POST', ...opts});
+      await fetch(base + '/latest.json', {method:'PUT', ...opts});
+      cmd = (await (await fetch(base + '/command.json')).json().catch(() => ({}))) || {};
+    } else {
+      res = await fetch(base, {method:'POST', ...opts});
+      cmd = await res.json().catch(() => ({}));
+    }
+    $('net').textContent = 'Sent OK (' + res.status + ')' + (cmd.valve ? ' - backend says valve: ' + cmd.valve : '');
+    if(cmd.valve === 'close') $('valve').value = 'closed';
+    if(cmd.valve === 'open') $('valve').value = 'open';
+  }catch(e){ $('net').textContent = 'Backend not reachable (values shown above only)'; }
+}
+$('sendBtn').onclick = send;
+$('autoBtn').onclick = () => {
+  if(timer){ clearInterval(timer); timer = null; $('autoBtn').textContent = 'Auto send: OFF'; }
+  else { send(); timer = setInterval(send, 1000); $('autoBtn').textContent = 'Auto send: ON (1/sec)'; }
+};
+</script>
+</body>
+</html>
